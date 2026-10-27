@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/buildbuddy-io/reninja/internal/elide_middle"
-	"github.com/mattn/go-isatty"
 	"golang.org/x/term"
 )
 
@@ -34,17 +33,7 @@ type LinePrinter struct {
 }
 
 func SmartTerminal() bool {
-	// A smart terminal supports escape sequences. Check that stdout is a tty
-	// and that TERM is set (even if empty) and not "dumb".
-	// This matches C++ ninja behavior: TERM="" is smart, TERM not set is not.
-	if !isatty.IsTerminal(os.Stdout.Fd()) {
-		return false
-	}
-	term, isSet := os.LookupEnv("TERM")
-	if !isSet {
-		return false
-	}
-	return term != "dumb"
+	return isSmartTerminal()
 }
 
 func SupportsColor() bool {

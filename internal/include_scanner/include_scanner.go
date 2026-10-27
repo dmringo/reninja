@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/buildbuddy-io/reninja/internal/command_line"
 	"github.com/buildbuddy-io/reninja/internal/statuserr"
-	"github.com/google/shlex"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
@@ -65,7 +65,7 @@ func New() *Scanner {
 // ScanEdge scans all input files for transitive #include dependencies
 // and returns the list of additional files not already in inputFiles.
 func (s *Scanner) ScanEdge(inputFiles []string, command string) ([]string, error) {
-	splitCommand, err := shlex.Split(command)
+	splitCommand, err := command_line.Split(command)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +298,18 @@ func statIncludeCandidate(dir, relPath string) string {
 	}
 
 	info, err := os.Stat(candidate)
+	if err != nil && strings.Contains(relPath, "..") {
+		// Windows does not resolve "symlink/.." through the symlink the way
+		// POSIX does. Resolve symlinks explicitly so includes that traverse a
+		// symlink and then go up still find their target.
+		if resolved, evalErr := filepath.EvalSymlinks(candidate); evalErr == nil {
+			if resolvedInfo, statErr := os.Stat(resolved); statErr == nil {
+				candidate = resolved
+				info = resolvedInfo
+				err = nil
+			}
+		}
+	}
 	if err != nil || info.IsDir() {
 		return ""
 	}
@@ -487,11 +499,24 @@ func walkDirectoryFiles(candidates []string) ([]string, error) {
 // token, it finds substrings matching root and trims trailing quotes.
 // Results are deduplicated. No filesystem access is performed.
 func extractCommandCandidatePaths(command, root string) []string {
+	tokens, err := command_line.Split(command)
+	if err != nil {
+		return nil
+	}
+
 	var paths []string
 	seen := make(map[string]struct{})
+	rootSlash := filepath.ToSlash(root)
+	rootLower := strings.ToLower(rootSlash)
 
-	for _, token := range strings.Fields(command) {
-		idx := strings.Index(token, root)
+	for _, token := range tokens {
+		tokenSlash := filepath.ToSlash(token)
+		idx := strings.Index(tokenSlash, rootSlash)
+		if idx < 0 {
+			// Paths in build files may use a different separator style than
+			// the detected project root.
+			idx = strings.Index(strings.ToLower(tokenSlash), rootLower)
+		}
 		if idx < 0 {
 			continue
 		}
@@ -524,10 +549,15 @@ func ExtractCommandReferencedPaths(command, root string) ([]string, error) {
 // would need to traverse to resolve the ".." components. These directories
 // must exist in the remote input tree for path resolution to succeed.
 func ExtractIntermediateDirsFromCommand(command string) []string {
+	tokens, err := command_line.Split(command)
+	if err != nil {
+		return nil
+	}
+
 	var dirs []string
 	seen := make(map[string]struct{})
 
-	for _, token := range strings.Fields(command) {
+	for _, token := range tokens {
 		path := token
 		// Strip common compiler flag prefixes to extract the path.
 		for _, prefix := range []string{"-I", "-L"} {
@@ -537,13 +567,16 @@ func ExtractIntermediateDirsFromCommand(command string) []string {
 			}
 		}
 
-		if !filepath.IsAbs(path) || !strings.Contains(path, "..") {
+		if !isPathAbsolute(path) || !strings.Contains(path, "..") {
 			continue
 		}
 
 		// Walk path components, collecting directories before each ".."
-		// that the kernel must enter during path resolution.
-		parts := strings.Split(path, "/")
+		// that the kernel must enter during path resolution. Use slashes for
+		// component splitting so Windows and POSIX-style paths behave alike.
+		slashPath := filepath.ToSlash(path)
+		rooted := strings.HasPrefix(slashPath, "/")
+		parts := strings.Split(slashPath, "/")
 		var stack []string
 		for _, part := range parts {
 			if part == "" || part == "." {
@@ -551,7 +584,10 @@ func ExtractIntermediateDirsFromCommand(command string) []string {
 			}
 			if part == ".." {
 				if len(stack) > 0 {
-					dir := "/" + strings.Join(stack, "/")
+					dir := strings.Join(stack, "/")
+					if rooted {
+						dir = "/" + dir
+					}
 					if _, ok := seen[dir]; !ok {
 						seen[dir] = struct{}{}
 						dirs = append(dirs, dir)
@@ -567,11 +603,31 @@ func ExtractIntermediateDirsFromCommand(command string) []string {
 	return dirs
 }
 
+// isPathAbsolute recognizes native absolute paths plus POSIX-style paths.
+// Build commands on Windows can still reference POSIX paths (for example when
+// driving a remote Linux toolchain), so both forms are treated as absolute.
+func isPathAbsolute(path string) bool {
+	return filepath.IsAbs(path) || strings.HasPrefix(path, "/")
+}
+
+// isUnderRoot reports whether p is root itself or lives underneath it. It
+// uses filepath.Rel so separator style and volume handling are consistent.
+func isUnderRoot(p, root string) bool {
+	rel, err := filepath.Rel(root, p)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // extractSearchDirectoryCandidates parses -I, -L, -isystem, and -iquote flags
 // from the command string, resolves relative paths to absolute, and filters to
 // under root. Results are deduplicated. No filesystem access is performed.
 func extractSearchDirectoryCandidates(command, root string) []string {
-	args, err := shlex.Split(command)
+	args, err := command_line.Split(command)
 	if err != nil {
 		return nil
 	}
@@ -588,7 +644,7 @@ func extractSearchDirectoryCandidates(command, root string) []string {
 			}
 			dir = abs
 		}
-		if !strings.HasPrefix(dir, root+"/") && dir != root {
+		if !isUnderRoot(dir, root) {
 			continue
 		}
 		if _, ok := seen[dir]; ok {
@@ -615,11 +671,16 @@ func ExtractSearchDirectoryContents(command, root string) ([]string, error) {
 // components, strips flag prefixes and shell operators, resolves via filepath.Abs,
 // and filters to under root. Results are deduplicated. No filesystem access is performed.
 func extractRelativeDotDotCandidates(command, root string) []string {
+	tokens, err := command_line.Split(command)
+	if err != nil {
+		return nil
+	}
+
 	var paths []string
 	seen := make(map[string]struct{})
 
-	for _, token := range strings.Fields(command) {
-		if filepath.IsAbs(token) || !strings.Contains(token, "..") {
+	for _, token := range tokens {
+		if isPathAbsolute(token) || !strings.Contains(token, "..") {
 			continue
 		}
 
@@ -641,7 +702,7 @@ func extractRelativeDotDotCandidates(command, root string) []string {
 			continue
 		}
 
-		if !strings.HasPrefix(abs, root+"/") && abs != root {
+		if !isUnderRoot(abs, root) {
 			continue
 		}
 
@@ -673,7 +734,7 @@ func ExtractRelativeDotDotContents(command, root string) ([]string, error) {
 // target directory. Filters to under root and deduplicates.
 // No filesystem access is performed.
 func extractCdRelativeCandidates(command, root string) []string {
-	fields, err := shlex.Split(command)
+	fields, err := command_line.Split(command)
 	if err != nil {
 		return nil
 	}
@@ -684,10 +745,10 @@ func extractCdRelativeCandidates(command, root string) []string {
 			break
 		}
 	}
-	if cdTarget == "" || !filepath.IsAbs(cdTarget) {
+	if cdTarget == "" || !isPathAbsolute(cdTarget) {
 		return nil
 	}
-	if !strings.HasPrefix(cdTarget, root+"/") && cdTarget != root {
+	if !isUnderRoot(cdTarget, root) {
 		return nil
 	}
 
@@ -695,7 +756,7 @@ func extractCdRelativeCandidates(command, root string) []string {
 	seen := make(map[string]struct{})
 
 	for _, token := range fields {
-		if filepath.IsAbs(token) {
+		if isPathAbsolute(token) {
 			continue
 		}
 		if strings.HasPrefix(token, "-") {
@@ -707,7 +768,7 @@ func extractCdRelativeCandidates(command, root string) []string {
 		path := strings.TrimRight(token, ";&|")
 		resolved := filepath.Clean(filepath.Join(cdTarget, path))
 
-		if !strings.HasPrefix(resolved, root+"/") && resolved != root {
+		if !isUnderRoot(resolved, root) {
 			continue
 		}
 
@@ -804,7 +865,7 @@ func ExtractThinArchiveMembers(archivePath string) []string {
 
 		if memberName != "" {
 			var resolved string
-			if filepath.IsAbs(memberName) {
+			if isPathAbsolute(memberName) {
 				resolved = memberName
 			} else {
 				resolved = filepath.Clean(filepath.Join(archiveDir, memberName))

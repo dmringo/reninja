@@ -13,6 +13,7 @@ import (
 
 	"github.com/buildbuddy-io/reninja/internal/build_config"
 	"github.com/buildbuddy-io/reninja/internal/cachetools"
+	"github.com/buildbuddy-io/reninja/internal/command_line"
 	"github.com/buildbuddy-io/reninja/internal/digest"
 	"github.com/buildbuddy-io/reninja/internal/exit_status"
 	"github.com/buildbuddy-io/reninja/internal/filetransfer"
@@ -26,7 +27,6 @@ import (
 	"github.com/buildbuddy-io/reninja/internal/statuserr"
 	"github.com/buildbuddy-io/reninja/internal/subprocess"
 	"github.com/buildbuddy-io/reninja/internal/util"
-	"github.com/google/shlex"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/metadata"
 
@@ -163,7 +163,7 @@ func (r *RemoteCachingCommandRunner) CanRunMore() int {
 }
 
 func assembleCommand(edge *graph.Edge) (*repb.Command, error) {
-	splitCommand, err := shlex.Split(edge.EvaluateCommand(false))
+	splitCommand, err := command_line.Split(edge.EvaluateCommand(false))
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/buildbuddy-io/reninja/internal/build_config"
 	"github.com/buildbuddy-io/reninja/internal/build_log"
+	"github.com/buildbuddy-io/reninja/internal/clparser"
 	"github.com/buildbuddy-io/reninja/internal/debug_flags"
 	"github.com/buildbuddy-io/reninja/internal/dependency_scan"
 	"github.com/buildbuddy-io/reninja/internal/depfile_parser"
@@ -1098,8 +1099,20 @@ func (b *Builder) ExtractDeps(result *spawn.Result, depsType, depsPrefix string)
 	depsNodes := make([]*graph.Node, 0)
 
 	if depsType == "msvc" {
-		// TODO(tylerw): CL PARSER LOGIC GOES HERE
-		return nil, fmt.Errorf("windows support tbd")
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		filteredOutput, includes, err := clparser.Parse(result.Output, depsPrefix, cwd)
+		if err != nil {
+			return nil, err
+		}
+		result.Output = filteredOutput
+		sort.Strings(includes)
+		for _, in := range includes {
+			path, _ := util.CanonicalizePath(in)
+			depsNodes = append(depsNodes, b.state.GetNode(path))
+		}
 	} else if depsType == "gcc" {
 		depfile := result.Edge.GetUnescapedDepfile()
 		if depfile == "" {

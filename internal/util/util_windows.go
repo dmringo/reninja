@@ -4,7 +4,17 @@ package util
 
 import (
 	"os"
+
+	"github.com/shirou/gopsutil/v4/load"
 )
+
+func GetLoadAverage() float64 {
+	avg, err := load.Avg()
+	if err != nil {
+		return -1
+	}
+	return avg.Load1
+}
 
 // ReplaceFileContent replaces the content of destPath with the content of
 // tempPath by removing destPath and renaming tempPath to destPath.

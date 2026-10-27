@@ -318,7 +318,8 @@ func (p *ManifestParser) parseEdge() error {
 		if path == "" {
 			return p.lexer.Error("empty path")
 		}
-		path, _ = util.CanonicalizePath(path)
+		path, slashBits := util.CanonicalizePath(path)
+		p.state.GetNodeWithSlashBits(path, slashBits)
 		if err := p.state.AddOut(path, edge); err != nil {
 			return err
 		}
@@ -337,7 +338,8 @@ func (p *ManifestParser) parseEdge() error {
 		if path == "" {
 			return p.lexer.Error("empty path")
 		}
-		path, _ = util.CanonicalizePath(path)
+		path, slashBits := util.CanonicalizePath(path)
+		p.state.GetNodeWithSlashBits(path, slashBits)
 		p.state.AddExplicitIn(path, edge)
 	}
 	for i := range len(p.implicitIns) {
@@ -345,7 +347,8 @@ func (p *ManifestParser) parseEdge() error {
 		if path == "" {
 			return p.lexer.Error("empty path")
 		}
-		path, _ = util.CanonicalizePath(path)
+		path, slashBits := util.CanonicalizePath(path)
+		p.state.GetNodeWithSlashBits(path, slashBits)
 		p.state.AddImplicitIn(path, edge)
 	}
 	for i := range len(p.orderOnlyIns) {
@@ -353,7 +356,8 @@ func (p *ManifestParser) parseEdge() error {
 		if path == "" {
 			return p.lexer.Error("empty path")
 		}
-		path, _ = util.CanonicalizePath(path)
+		path, slashBits := util.CanonicalizePath(path)
+		p.state.GetNodeWithSlashBits(path, slashBits)
 		p.state.AddOrderOnlyIn(path, edge)
 	}
 
@@ -362,7 +366,8 @@ func (p *ManifestParser) parseEdge() error {
 		if path == "" {
 			return p.lexer.Error("empty path")
 		}
-		path, _ = util.CanonicalizePath(path)
+		path, slashBits := util.CanonicalizePath(path)
+		p.state.GetNodeWithSlashBits(path, slashBits)
 		p.state.AddValidation(path, edge)
 	}
 
@@ -384,8 +389,9 @@ func (p *ManifestParser) parseEdge() error {
 	// be one of our manifest-specified inputs.
 	dyndep := edge.GetUnescapedDyndep()
 	if dyndep != "" {
-		dyndep, _ = util.CanonicalizePath(dyndep)
-		node := p.state.GetNode(dyndep)
+		var dyndepSlashBits uint64
+		dyndep, dyndepSlashBits = util.CanonicalizePath(dyndep)
+		node := p.state.GetNodeWithSlashBits(dyndep, dyndepSlashBits)
 		node.SetDyndepPending(true)
 		edge.SetDyndep(node)
 		if !slices.Contains(edge.Inputs(), node) {

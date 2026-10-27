@@ -3,11 +3,8 @@
 package jobserver
 
 import (
-	"errors"
 	"fmt"
-	"os"
 	"runtime"
-	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -15,99 +12,64 @@ import (
 )
 
 var (
-	libKernel32       = windows.NewLazySystemDLL("kernel32.dll")
-	pOpenSemaphoreA   uintptr
-	pReleaseSemaphore uintptr
+	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
+	procOpenSemaphoreA      = kernel32.NewProc("OpenSemaphoreA")
+	procReleaseSemaphore    = kernel32.NewProc("ReleaseSemaphore")
+	procWaitForSingleObject = kernel32.NewProc("WaitForSingleObject")
 )
-
-// This is cobbled together from:
-//  1) https://github.com/zzl/go-win32api/
-//  2) https://github.com/heucuva/go-win32/
-//  3) https://pkg.go.dev/golang.org/x/sys/windows
 
 const (
-	WAIT_TIMEOUT          = 0x00000102
-	errnoERROR_IO_PENDING = 997
-)
+	WAIT_TIMEOUT = 0x00000102
 
-var (
-	errERROR_IO_PENDING error = syscall.Errno(errnoERROR_IO_PENDING)
-	errERROR_EINVAL     error = syscall.EINVAL
-	WaitTimeout               = errors.New("wait timeout")
+	SEMAPHORE_MODIFY_STATE      = 0x0002
+	SYNCHRONIZATION_SYNCHRONIZE = 0x00100000
 )
-
-type SYNCHRONIZATION_ACCESS_RIGHTS uint32
 
 const (
-	SEMAPHORE_MODIFY_STATE      SYNCHRONIZATION_ACCESS_RIGHTS = 2
-	SYNCHRONIZATION_SYNCHRONIZE SYNCHRONIZATION_ACCESS_RIGHTS = 1048576
+	// Hard-coded value used for explicit slots acquired from a Windows
+	// semaphore. Windows jobservers are counted, not token-based, so the
+	// value is never written back anywhere.
+	explicitSlotValue = 1
 )
 
-// errnoErr returns common boxed Errno values, to prevent
-// allocations at runtime.
-func errnoErr(e syscall.Errno) error {
-	switch e {
-	case 0:
-		return errERROR_EINVAL
-	case errnoERROR_IO_PENDING:
-		return errERROR_IO_PENDING
+func openSemaphoreA(desiredAccess uint32, inheritHandle bool, name string) (windows.Handle, error) {
+	p, err := windows.BytePtrFromString(name)
+	if err != nil {
+		return 0, err
 	}
-	// TODO: add more here, after collecting data on the common
-	// error values see on Windows. (perhaps when running
-	// all.bat?)
-	return e
-}
-
-func LazyAddr(pAddr *uintptr, lib *windows.LazyDLL, procName string) uintptr {
-	addr := atomic.LoadUintptr(pAddr)
-	if addr == 0 {
-		addr = lib.NewProc(procName).Addr()
-		atomic.StoreUintptr(pAddr, addr)
+	var inherit uintptr
+	if inheritHandle {
+		inherit = 1
 	}
-	return addr
-}
-
-func OpenSemaphoreA(dwDesiredAccess *uint32, bInheritHandle bool, lpName string) (handle windows.Handle, err error) {
-	var _p2 uint32
-	if bInheritHandle {
-		_p2 = 1
-	}
-	var _p3 *byte
-	if _p3, err = syscall.BytePtrFromString(lpName); err != nil {
-		return
-	}
-
-	addr := LazyAddr(&pOpenSemaphoreA, libKernel32, "OpenSemaphoreA")
-	r1, _, e1 := syscall.SyscallN(addr, uintptr(unsafe.Pointer(dwDesiredAccess)), uintptr(_p2), uintptr(unsafe.Pointer(_p3)))
-	handle = windows.Handle(r1)
+	r1, _, e1 := procOpenSemaphoreA.Call(
+		uintptr(desiredAccess),
+		inherit,
+		uintptr(unsafe.Pointer(p)),
+	)
 	if r1 == 0 {
-		err = errnoErr(e1)
+		return 0, e1
 	}
-	return
+	return windows.Handle(r1), nil
 }
 
-func ReleaseSemaphore(hSemaphore windows.Handle, lReleaseCount int32, lpPreviousCount *int32) (b bool, err error) {
-	h := atomic.LoadUintptr((*uintptr)(&handle))
-	addr := LazyAddr(&pReleaseSemaphore, libKernel32, "ReleaseSemaphore")
-	r1, _, e1 := syscall.SyscallN(addr, uintptr(handle), uintptr(lReleaseCount), uintptr(unsafe.Pointer(lpPreviousCount)))
-	b = r1
+func releaseSemaphore(h windows.Handle, releaseCount int32) error {
+	r1, _, e1 := procReleaseSemaphore.Call(
+		uintptr(h),
+		uintptr(releaseCount),
+		0,
+	)
 	if r1 == 0 {
-		err = errnoErr(e1)
+		return e1
 	}
-	return
+	return nil
 }
 
-func WaitForSingleObject(handle windows.Handle, durationMillis uint32) error {
-	h := atomic.LoadUintptr((*uintptr)(&handle))
-	s, e := windows.WaitForSingleObject(windows.Handle(h), durationMillis)
-	switch s {
-	case windows.WAIT_OBJECT_0:
-		return nil
-	case WAIT_TIMEOUT:
-		return WaitTimeout
-	default:
-		return os.NewSyscallError("WaitForSingleObject", e)
+func waitForSingleObject(h windows.Handle, millis uint32) (uint32, error) {
+	r1, _, e1 := procWaitForSingleObject.Call(uintptr(h), uintptr(millis))
+	if uint32(r1) == windows.WAIT_FAILED {
+		return uint32(r1), e1
 	}
+	return uint32(r1), nil
 }
 
 type windowsClient struct {
@@ -122,38 +84,47 @@ func (c *windowsClient) TryAcquire() Slot {
 			return CreateImplicitSlot()
 		}
 
-		if WaitForSingleObject(c.handle, 0) == nil {
-			// Hard-code value 1 for the explicit slot value.
-			return CreateExplicitSlot(1)
+		event, err := waitForSingleObject(c.handle, 0)
+		if err == nil && event == windows.WAIT_OBJECT_0 {
+			return CreateExplicitSlot(explicitSlotValue)
 		}
 	}
 	return NewSlot()
 }
 
-func (c *unixClient) Release(slot Slot) {
+func (c *windowsClient) Release(slot Slot) {
 	if !slot.Valid() {
 		return
 	}
 	if slot.Implicit() {
-		if !c.hasImplicitSlot {
+		if c.hasImplicitSlot {
 			panic("Implicit slot cannot be released twice!")
 		}
 		c.hasImplicitSlot = true
 		return
 	}
-	ReleaseSemaphore(c.handle, 1)
+	// Nothing useful can be done if the semaphore was closed underneath us;
+	// ninja ignores this error as well.
+	_ = releaseSemaphore(c.handle, 1)
 }
 
 func (c *windowsClient) InitWithSemaphore(name string) error {
-	flags := uint32(SYNCHRONIZATION_SYNCHRONIZE | SEMAPHORE_MODIFY_STATE)
-	h, err := OpenSemaphoreA(&flags, false, name)
+	if name == "" {
+		return fmt.Errorf("Empty semaphore name")
+	}
+	h, err := openSemaphoreA(
+		SYNCHRONIZATION_SYNCHRONIZE|SEMAPHORE_MODIFY_STATE,
+		false,
+		name,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("Error opening semaphore %q: %s", name, err)
 	}
 	c.handle = h
+	c.hasImplicitSlot = true
 
 	runtime.AddCleanup(c, func(h windows.Handle) {
-		syscall.CloseHandle(syscall.Handle(h))
+		_ = syscall.CloseHandle(syscall.Handle(h))
 	}, h)
 	return nil
 }
@@ -163,11 +134,10 @@ func (c *windowsClient) IsValid() bool {
 }
 
 func (c *windowsClient) Create(config *Config) error {
-	if config.Mode == ModePosixFifo {
+	if config.Mode == ModeWin32Semaphore || config.Mode == ModeDefault {
 		return c.InitWithSemaphore(config.Path)
-	} else {
-		return fmt.Errorf("Unsupported jobserver mode")
 	}
+	return fmt.Errorf("Unsupported jobserver mode")
 }
 
 func NewClient() Client {

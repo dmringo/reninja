@@ -155,5 +155,6 @@ func WorkingDirectory() string {
 	if wd == "." {
 		return ""
 	}
-	return wd
+	// REAPI paths always use forward slashes.
+	return filepath.ToSlash(wd)
 }

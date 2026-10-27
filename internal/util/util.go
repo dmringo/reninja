@@ -3,7 +3,7 @@ package util
 import (
 	"fmt"
 	"os"
-	"path/filepath"
+	"path"
 	"runtime"
 	"runtime/metrics"
 	"strings"
@@ -41,32 +41,43 @@ func (f *StringList) Get() any {
 	return *f
 }
 
-// CanonicalizePath normalizes a path to use forward slashes and returns slash bits
-// TODO(tylerw): review this, it's probably wrong.
-func CanonicalizePath(path string) (outp string, outs uint64) {
-	if !strings.ContainsRune(path, '\\') {
-		return filepath.Clean(path), 0
-	}
-
+// CanonicalizePath normalizes a path to use forward slashes and returns slash bits.
+//
+// The canonical form always uses '/', even on Windows. Windows-style
+// backslashes are converted and recorded in the returned slash bits so that
+// PathDecanonicalized can restore the original spelling when expanding
+// command variables.
+func CanonicalizePath(p string) (outp string, outs uint64) {
 	var slashBits uint64
-	bit := uint64(1)
-	result := strings.Builder{}
-	result.Grow(len(path))
+	if runtime.GOOS == "windows" && strings.ContainsRune(p, '\\') {
+		bit := uint64(1)
+		result := strings.Builder{}
+		result.Grow(len(p))
 
-	for _, ch := range path {
-		if ch == '\\' {
-			result.WriteByte('/')
-			slashBits |= bit
-			bit <<= 1
-		} else {
-			result.WriteRune(ch)
-			if ch == '/' {
+		for _, ch := range p {
+			if ch == '\\' {
+				result.WriteByte('/')
+				slashBits |= bit
 				bit <<= 1
+			} else {
+				result.WriteRune(ch)
+				if ch == '/' {
+					bit <<= 1
+				}
 			}
 		}
+		p = result.String()
 	}
 
-	return filepath.Clean(result.String()), slashBits
+	cleaned := path.Clean(p)
+	// path.Clean collapses leading slashes; preserve the "//" prefix used by
+	// Windows UNC paths.
+	if runtime.GOOS == "windows" &&
+		strings.HasPrefix(p, "//") && !strings.HasPrefix(p, "///") &&
+		strings.HasPrefix(cleaned, "/") {
+		cleaned = "/" + cleaned
+	}
+	return cleaned, slashBits
 }
 
 func GetProgramMemoryUsageMB() float64 {

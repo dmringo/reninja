@@ -3,13 +3,13 @@ package subprocess
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/buildbuddy-io/reninja/internal/exit_status"
@@ -23,7 +23,7 @@ var (
 func handleSignals() {
 	once.Do(func() {
 		signalChannel := make(chan os.Signal, 1)
-		signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		signal.Notify(signalChannel, interruptSignals()...)
 		go func() {
 			<-signalChannel
 			interrupted.Store(true)
@@ -48,19 +48,25 @@ type Subprocess struct {
 	cmd          *exec.Cmd
 	stdOutAndErr *bytes.Buffer
 
-	mu        *sync.Mutex
-	exitError *exec.ExitError
-	done      chan struct{}
+	mu            *sync.Mutex
+	exitError     *exec.ExitError
+	failedToStart bool
+	done          chan struct{}
 }
 
 func NewSubprocess(command string, useConsole bool) (*Subprocess, error) {
 	handleSignals()
 
 	ctx, cancelFunc := context.WithCancel(context.TODO())
+	cmd, err := newCommandContext(ctx, command, useConsole)
+	if err != nil {
+		cancelFunc()
+		return nil, err
+	}
 	s := &Subprocess{
 		ctx:        ctx,
 		cancelFunc: cancelFunc,
-		cmd:        exec.CommandContext(ctx, "/bin/sh", "-c", command),
+		cmd:        cmd,
 		done:       make(chan struct{}),
 		mu:         &sync.Mutex{},
 	}
@@ -75,6 +81,19 @@ func NewSubprocess(command string, useConsole bool) (*Subprocess, error) {
 	}
 
 	if err := s.cmd.Start(); err != nil {
+		// Windows CreateProcess reports a missing executable at spawn time.
+		// Ninja treats that as an ordinary failed command, not a fatal setup
+		// error, so do the same rather than aborting the whole build.
+		if errors.Is(err, exec.ErrNotFound) {
+			if s.stdOutAndErr == nil {
+				s.stdOutAndErr = &bytes.Buffer{}
+				s.stdOutAndErr.WriteString(err.Error())
+				s.stdOutAndErr.WriteByte('\n')
+			}
+			s.failedToStart = true
+			close(s.done)
+			return s, nil
+		}
 		return nil, err
 	}
 	go func() {
@@ -124,7 +143,12 @@ func (s *Subprocess) Finish() exit_status.ExitStatusType {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.exitError == nil {
+		if s.failedToStart {
+			return exit_status.ExitFailure
+		}
 		return exit_status.ExitSuccess
+	} else if isInterruptExitCode(s.exitError.ProcessState.ExitCode()) {
+		return exit_status.ExitInterrupted
 	} else if strings.Contains(s.exitError.String(), "interrupt") {
 		return exit_status.ExitInterrupted
 	} else if strings.Contains(s.exitError.String(), "terminated") {

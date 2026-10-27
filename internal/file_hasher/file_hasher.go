@@ -3,7 +3,6 @@ package file_hasher
 import (
 	"os"
 	"sync"
-	"syscall"
 
 	"github.com/buildbuddy-io/reninja/internal/digest"
 	"github.com/djherbis/times"
@@ -18,6 +17,8 @@ var (
 type hashKey struct {
 	dev        uint64
 	inode      uint64
+	path       string
+	size       int64
 	ctimeNano  int64
 	digestType int32
 }
@@ -35,16 +36,8 @@ func HashFile(path string, digestType repb.DigestFunction_Value) (*repb.Digest, 
 	}
 	t := times.Get(fi)
 
-	var key hashKey
-	stat, ok := fi.Sys().(*syscall.Stat_t)
+	key, ok := statKey(path, fi, t, int32(digestType))
 	if ok {
-		key = hashKey{
-			dev:        stat.Dev,
-			inode:      stat.Ino,
-			ctimeNano:  t.ChangeTime().UnixNano(),
-			digestType: int32(digestType),
-		}
-
 		if digestKey, ok := fileHashes.Load(key); ok {
 			return digestKey.(digest.Key).ToDigest(), nil
 		}

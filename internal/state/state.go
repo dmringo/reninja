@@ -89,13 +89,18 @@ func (s *State) Dump() {
 
 // GetNode returns a node by path, creating it if necessary
 func (s *State) GetNode(canonicalPath string) *graph.Node {
+	return s.GetNodeWithSlashBits(canonicalPath, 0)
+}
+
+// GetNodeWithSlashBits returns the node for canonicalPath, creating it with
+// slashBits if it does not exist yet. slashBits records which '/' characters
+// were originally backslashes so command expansion can restore them.
+func (s *State) GetNodeWithSlashBits(canonicalPath string, slashBits uint64) *graph.Node {
 	node := s.LookupNode(canonicalPath)
 	if node != nil {
 		return node
 	}
-
-	// TODO(tylerw): remove SlashBits everwhere?
-	node = graph.NewNode(canonicalPath, 0)
+	node = graph.NewNode(canonicalPath, slashBits)
 	s.paths[canonicalPath] = node
 	return node
 }

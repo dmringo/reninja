@@ -4,11 +4,11 @@ import (
 	"io"
 	"sync"
 
+	"github.com/buildbuddy-io/reninja/internal/command_line"
 	"github.com/buildbuddy-io/reninja/internal/file_hasher"
 	"github.com/buildbuddy-io/reninja/internal/graph"
 	"github.com/buildbuddy-io/reninja/internal/remote_flags"
 	"github.com/buildbuddy-io/reninja/internal/spawn"
-	"github.com/google/shlex"
 	"google.golang.org/protobuf/encoding/protodelim"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -128,7 +128,7 @@ func (l *Log) RecordEdge(edge *graph.Edge, result *spawn.Result) error {
 	}
 
 	command := edge.EvaluateCommand(true)
-	args, err := shlex.Split(command)
+	args, err := command_line.Split(command)
 	if err != nil {
 		return err
 	}

@@ -2,10 +2,8 @@ package ninjarc
 
 import (
 	"bufio"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/user"
@@ -13,10 +11,10 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/buildbuddy-io/reninja/internal/command_line"
 	"github.com/buildbuddy-io/reninja/internal/disk"
 	"github.com/buildbuddy-io/reninja/internal/project_root"
 	"github.com/buildbuddy-io/reninja/internal/util"
-	"github.com/google/shlex"
 )
 
 const (
@@ -67,24 +65,45 @@ type RcRule struct {
 }
 
 // resolvePath resolves a ninjarc path by expanding %workspace%/ and ~
-// prefixes, cleaning the path, and stripping the leading "/" so it is
-// suitable for use with fs.FS (which requires unrooted paths).
-func resolvePath(workspaceDir, path string) string {
-	if strings.HasPrefix(path, workspacePrefix) {
-		path = filepath.Join(workspaceDir, path[len(workspacePrefix):])
+// prefixes, cleaning the path, and making it relative to the filesystem root
+// backing the RC FS. fs.FS paths must be unrooted, so drive letters and
+// leading separators are stripped. The FS root is the volume containing
+// workspaceDir (on Windows) or "/" elsewhere.
+func resolvePath(workspaceDir, p string) string {
+	if strings.HasPrefix(p, workspacePrefix) {
+		p = filepath.Join(workspaceDir, p[len(workspacePrefix):])
 	}
 
-	if strings.HasPrefix(path, "~") {
+	if strings.HasPrefix(p, "~") {
 		currentUser, err := user.Current()
 		if err == nil {
-			path = strings.Replace(path, "~", currentUser.HomeDir, 1)
+			p = filepath.Join(currentUser.HomeDir, strings.TrimPrefix(p, "~"))
 		}
 	}
 
-	path = filepath.Clean(path)
-	// fs.FS paths must be unrooted — strip leading "/".
-	path = strings.TrimPrefix(path, "/")
-	return path
+	p = filepath.Clean(p)
+	rootVolume := filepath.VolumeName(workspaceDir)
+	if volume := filepath.VolumeName(p); volume != "" {
+		if rootVolume != "" && !strings.EqualFold(volume, rootVolume) {
+			// The file lives on another volume than the FS root. Leave it
+			// absolute so the FS layer rejects it instead of opening a
+			// same-named path on the wrong drive.
+			return filepath.ToSlash(p)
+		}
+		p = strings.TrimPrefix(p, volume)
+	}
+
+	// fs.FS paths must be unrooted.
+	return strings.TrimLeft(filepath.ToSlash(p), "/")
+}
+
+// rcFSRoot returns the root directory that all resolved RC paths are
+// relative to.
+func rcFSRoot(workspaceDir string) string {
+	if volume := filepath.VolumeName(workspaceDir); volume != "" {
+		return volume + string(filepath.Separator)
+	}
+	return string(filepath.Separator)
 }
 
 // AppendRcRulesFromFile reads and lexes the provided rc file and appends the
@@ -115,17 +134,9 @@ func AppendRcRulesFromFile(fsys fs.FS, workspaceDir string, path string, namedCo
 		for strings.HasSuffix(line, `\`) && scanner.Scan() {
 			line = line[:len(line)-1] + scanner.Text()
 		}
-		lexer := shlex.NewLexer(strings.NewReader(line))
-		tokens := []string{}
-		for {
-			token, err := lexer.Next()
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				return fmt.Errorf("Error parsing ninjarc: %s\nFailed to lex '%s'.", err, line)
-			}
-			tokens = append(tokens, token)
+		tokens, err := command_line.Split(line)
+		if err != nil {
+			return fmt.Errorf("Error parsing ninjarc: %s\nFailed to lex '%s'.", err, line)
 		}
 		if len(tokens) == 0 {
 			// blank line
@@ -133,14 +144,17 @@ func AppendRcRulesFromFile(fsys fs.FS, workspaceDir string, path string, namedCo
 		}
 		if tokens[0] == "import" || tokens[0] == "try-import" {
 			isOptional := tokens[0] == "try-import"
-			importPath := strings.TrimSpace(strings.TrimPrefix(line, tokens[0]))
+			if len(tokens) < 2 {
+				return fmt.Errorf("Error parsing ninjarc: missing import path in '%s'", line)
+			}
+			importPath := tokens[1]
 			if err := AppendRcRulesFromFile(fsys, workspaceDir, resolvePath(workspaceDir, importPath), namedConfigs, defaultConfig, importStack, isOptional); err != nil {
 				return err
 			}
 			continue
 		}
 
-		rule, err := parseRcRule(line)
+		rule, err := parseRcRule(tokens)
 		if err != nil {
 			util.Errorf("Error parsing ninjarc option: %s", err.Error())
 			continue
@@ -163,11 +177,7 @@ func AppendRcRulesFromFile(fsys fs.FS, workspaceDir string, path string, namedCo
 	return scanner.Err()
 }
 
-func parseRcRule(line string) (*RcRule, error) {
-	tokens, err := shlex.Split(line)
-	if err != nil {
-		return nil, err
-	}
+func parseRcRule(tokens []string) (*RcRule, error) {
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("unexpected empty line")
 	}
@@ -272,16 +282,45 @@ func ParseAndApplyRCFilesToFlags(toolName string) error {
 		return nil
 	}
 
-	filePaths := rcFileLocations
-	if *ninjaRCFile != "" {
-		if !disk.FileExists(*ninjaRCFile) {
-			util.Fatalf("ninjarc file '%s' not found", *ninjaRCFile)
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	workspaceDir := project_root.Root()
+
+	filePaths := make([]string, 0, len(rcFileLocations)+1)
+	for _, p := range rcFileLocations {
+		// The CWD .ninjarc is relative to the process, not to the RC FS root.
+		if p == ".ninjarc" {
+			p = filepath.Join(cwd, p)
 		}
-		filePaths = append(filePaths, *ninjaRCFile)
+		filePaths = append(filePaths, p)
+	}
+	if *ninjaRCFile != "" {
+		p := *ninjaRCFile
+		if strings.HasPrefix(p, workspacePrefix) {
+			p = filepath.Join(workspaceDir, p[len(workspacePrefix):])
+		}
+		if strings.HasPrefix(p, "~") {
+			currentUser, err := user.Current()
+			if err == nil {
+				p = filepath.Join(currentUser.HomeDir, strings.TrimPrefix(p, "~"))
+			}
+		}
+		if !filepath.IsAbs(p) {
+			abs, err := filepath.Abs(p)
+			if err != nil {
+				return err
+			}
+			p = abs
+		}
+		if !disk.FileExists(p) {
+			util.Fatalf("ninjarc file '%s' not found", p)
+		}
+		filePaths = append(filePaths, p)
 	}
 
-	workspaceDir := project_root.Root()
-	rcConfig, err := ParseRCFiles(os.DirFS("/"), workspaceDir, rcFileLocations...)
+	rcConfig, err := ParseRCFiles(os.DirFS(rcFSRoot(workspaceDir)), workspaceDir, filePaths...)
 	if err != nil {
 		return err
 	}

@@ -1,12 +1,15 @@
 package disk
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"maps"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -65,7 +68,7 @@ func (d *RealDiskInterface) Stat(path string) (timestamp.TimeStamp, error) {
 		}
 		return timestamp.TimeStampUnknown, err
 	}
-	mtime := timestamp.TimeStamp(info.ModTime().UnixNano())
+	mtime := timestamp.FromTime(info.ModTime())
 	return mtime, nil
 }
 
@@ -82,7 +85,9 @@ func (d *RealDiskInterface) Create(path string, contents []byte) error {
 }
 
 func (d *RealDiskInterface) WriteFile(path string, contents []byte, crlfOnWindows bool) error {
-	// TODO(tylerw): windows support do something.
+	if runtime.GOOS == "windows" && crlfOnWindows {
+		contents = bytes.ReplaceAll(contents, []byte("\n"), []byte("\r\n"))
+	}
 	return os.WriteFile(path, contents, 0644)
 }
 
@@ -91,7 +96,7 @@ func (d *RealDiskInterface) MakeDirs(path string) error {
 }
 
 func (d *RealDiskInterface) RemoveFile(path string) int {
-	err := os.Remove(path)
+	err := removeFile(path)
 	if err == nil {
 		return 0
 	} else if os.IsNotExist(err) {
@@ -169,8 +174,8 @@ func (m *MockDiskInterface) MakeDir(path string) error {
 }
 
 // MakeDir creates a mock directory
-func (m *MockDiskInterface) MakeDirs(path string) error {
-	for d := filepath.Dir(path); d != "." && d != "/"; d = filepath.Dir(d) {
+func (m *MockDiskInterface) MakeDirs(p string) error {
+	for d := pathpkg.Dir(p); d != "." && d != "/"; d = pathpkg.Dir(d) {
 		if err := m.MakeDir(d); err != nil {
 			return err
 		}

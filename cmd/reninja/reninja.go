@@ -1336,9 +1336,13 @@ options:
 	return 0
 }
 
-func (m *NinjaMain) ToolWinCodePage(*Options, []string) int {
-	util.Error("TBD: windows support")
-	return 1
+func (m *NinjaMain) ToolWinCodePage(_ *Options, args []string) int {
+	if len(args) != 0 {
+		fmt.Printf("usage: ninja -t wincodepage\n")
+		return 1
+	}
+	fmt.Printf("Build file encoding: %s\n", buildFileEncoding())
+	return 0
 }
 
 type PrintCommandMode int
@@ -1387,6 +1391,9 @@ func ChooseTool(toolName string) *Tool {
 		{"rules", "list all rules", runAfterLoad, lookupDispatchFunc("ToolRules")},
 		{"cleandead", "clean built files that are no longer produced by the manifest", runAfterLogs, lookupDispatchFunc("ToolCleanDead")},
 		{"urtle", "", runAfterFlags, lookupDispatchFunc("ToolUrtle")},
+	}
+	if runtime.GOOS == "windows" {
+		tools = append(tools, &Tool{"wincodepage", "print the Windows code page used by ninja", runAfterFlags, lookupDispatchFunc("ToolWinCodePage")})
 	}
 
 	if toolName == "list" {

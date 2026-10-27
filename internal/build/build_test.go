@@ -621,7 +621,7 @@ func (d *FakeCommandRunner) StartCommand(edge *graph.Edge) error {
 	require.NotContains(d.t, d.activeEdges, edge)
 	d.commandsRan = append(d.commandsRan, edge.EvaluateCommand(false))
 	switch edge.Rule().Name() {
-	case "cat", "cat_rsp", "cat_rsp_out", "cc", "cp_multi_msvc", "cp_multi_gcc", "touch", "touch-interrupt", "touch-fail-tick2":
+	case "cat", "cat_rsp", "cat_rsp_out", "cc", "cp_multi_msvc", "cp_multi_gcc", "msvc", "touch", "touch-interrupt", "touch-fail-tick2":
 		for _, out := range edge.Outputs() {
 			d.fs.Create(out.Path(), []byte{})
 		}
@@ -718,7 +718,7 @@ func (d *FakeCommandRunner) WaitForCommand() *spawn.Result {
 		return r
 	}
 
-	if edge.Rule().Name() == "cp_multi_msvc" {
+	if edge.Rule().Name() == "cp_multi_msvc" || edge.Rule().Name() == "msvc" {
 		prefix := edge.GetBinding("msvc_deps_prefix")
 		for _, in := range edge.Inputs() {
 			r.Output += prefix + in.Path() + "\n"
@@ -807,13 +807,22 @@ func newBuildTestHelperWithBuildLog(t *testing.T) *buildTestHelper {
 }
 
 func newBuildTestHelperWithDepsLog(t *testing.T) *buildTestHelper {
-	depsLog := deps_log.NewDepsLog()
-	t.Cleanup(func() {
-		depsLog.Close()
-	})
-
-	require.NoError(t, depsLog.OpenForWrite(filepath.Join(t.TempDir(), "deps_log")))
+	depsPath := filepath.Join(t.TempDir(), "deps_log")
+	depsLog := newTestDepsLog(t)
+	require.NoError(t, depsLog.OpenForWrite(depsPath))
 	return newBuildTestHelperWithLogs(t, nil, depsLog)
+}
+
+// newTestDepsLog returns a DepsLog that is closed when the test completes.
+// Open files cannot be removed on Windows, so leaving one open would break
+// t.TempDir cleanup.
+func newTestDepsLog(t *testing.T) *deps_log.DepsLog {
+	t.Helper()
+	log := deps_log.NewDepsLog()
+	t.Cleanup(func() {
+		_ = log.Close()
+	})
+	return log
 }
 
 func newBuildTestHelperWithLogs(t *testing.T, buildLog *build_log.BuildLog, depsLog *deps_log.DepsLog) *buildTestHelper {
@@ -870,14 +879,16 @@ func (h *buildTestHelper) RebuildTarget(target, manifest, logPath, depsPath stri
 		buildLog := build_log.NewBuildLog()
 		assert.NoError(t, buildLog.Load(logPath))
 		assert.NoError(t, buildLog.OpenForWrite(logPath, h))
+		t.Cleanup(func() { buildLog.Close() })
 		pbuildLog = buildLog
 	}
 
 	var pdepsLog *deps_log.DepsLog
 	if depsPath != "" {
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		assert.NoError(t, depsLog.Load(depsPath, pstate))
 		assert.NoError(t, depsLog.OpenForWrite(depsPath))
+		t.Cleanup(func() { depsLog.Close() })
 		pdepsLog = depsLog
 	}
 
@@ -2509,7 +2520,7 @@ build out: cat in1
 		test.AssertParse(t, manifest, state)
 
 		// Run the build once, everything should be ok.
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
 		builder := build.NewBuilder(state, th.config, nil, depsLog, th.fs, th.status, 0)
@@ -2541,7 +2552,7 @@ build out: cat in1
 		th.fs.Create("in2", []byte{})
 
 		// Run the build again.
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2557,6 +2568,30 @@ build out: cat in1
 		assert.Len(t, th.commandRunner.commandsRan, 1)
 		builder.TestOnlySetCommandRunner(nil)
 	}
+}
+
+func TestDepsMSVC(t *testing.T) {
+	th := newBuildTestHelperWithDepsLog(t)
+	th.fs.Create("foo.h", []byte{})
+
+	test.AssertParse(t, `
+rule msvc
+  command = cl /showIncludes
+  deps = msvc
+  msvc_deps_prefix = Note: including file:
+build out.o: msvc foo.h
+`, th.state)
+
+	_, err := th.builder.AddTargetByName("out.o")
+	require.NoError(t, err)
+	buildRes, err := th.builder.Build()
+	require.NoError(t, err)
+	require.Equal(t, exit_status.ExitSuccess, buildRes)
+
+	deps := th.depsLog.GetDeps(th.state.GetNode("out.o"))
+	require.NotNil(t, deps)
+	require.Len(t, deps.Nodes, 1)
+	assert.Equal(t, "foo.h", deps.Nodes[0].Path())
 }
 
 // ObsoleteDeps tests that even when files are in alignment, we should still
@@ -2586,7 +2621,7 @@ build out: cat in1
 		test.AssertParse(t, manifest, state)
 
 		// Run the build once, everything should be ok.
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
 		builder := build.NewBuilder(state, th.config, nil, depsLog, th.fs, th.status, 0)
@@ -2615,7 +2650,7 @@ build out: cat in1
 		test.AddCatRule(t, state)
 		test.AssertParse(t, manifest, state)
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2695,7 +2730,7 @@ build out: long-cc in1
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2731,7 +2766,7 @@ build out: long-cc in1
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2771,7 +2806,7 @@ build out: long-cc in1
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2818,7 +2853,7 @@ build out: long-cc
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2855,7 +2890,7 @@ build out: long-cc
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2886,7 +2921,7 @@ build out: long-cc
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2918,7 +2953,7 @@ build out: long-cc
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2949,7 +2984,7 @@ build out: long-cc
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -2979,7 +3014,7 @@ build out: long-cc
 		require.NoError(t, buildLog.Load(buildLogFile))
 		require.NoError(t, buildLog.OpenForWrite(buildLogFile, th))
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -3021,7 +3056,7 @@ build out: cat in1
 		test.AssertParse(t, manifest, state)
 
 		// Run the build once, everything should be ok.
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
 		builder := build.NewBuilder(state, th.config, nil, depsLog, th.fs, th.status, 0)
@@ -3047,7 +3082,7 @@ build out: cat in1
 		th.fs.Create("header.in", []byte{})
 
 		// Run the build again.
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -3089,7 +3124,7 @@ build fo$ o.o: cc foo.c
 		test.AssertParse(t, manifest, state)
 
 		// Run the build once, everything should be ok.
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
 		builder := build.NewBuilder(state, th.config, nil, depsLog, th.fs, th.status, 0)
@@ -3109,7 +3144,7 @@ build fo$ o.o: cc foo.c
 		state := state.New()
 		test.AssertParse(t, manifest, state)
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -3164,7 +3199,7 @@ build out2: generate-depfile in1 || out1
 		state := state.New()
 		test.AssertParse(t, manifest, state)
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
 		builder := build.NewBuilder(state, th.config, buildLog, depsLog, th.fs, th.status, 0)
@@ -3189,7 +3224,7 @@ build out2: generate-depfile in1 || out1
 		state := state.New()
 		test.AssertParse(t, manifest, state)
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 
@@ -3214,7 +3249,7 @@ build out2: generate-depfile in1 || out1
 		state := state.New()
 		test.AssertParse(t, manifest, state)
 
-		depsLog := deps_log.NewDepsLog()
+		depsLog := newTestDepsLog(t)
 		require.NoError(t, depsLog.Load(depsLogFile, state))
 		require.NoError(t, depsLog.OpenForWrite(depsLogFile))
 

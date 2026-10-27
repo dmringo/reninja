@@ -3,6 +3,9 @@ package deps_log_test
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/buildbuddy-io/reninja/internal/deps_log"
@@ -14,19 +17,57 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const (
-	testFilename = "DepsLogTest-tempfile"
+var (
+	testLogDir     string
+	testLogCounter atomic.Int64
+	testLogPaths   sync.Map // map[*testing.T]string
 )
 
-func TestWriteRead(t *testing.T) {
-	os.Remove(testFilename)
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "reninja-deps-log-test")
+	if err != nil {
+		panic(err)
+	}
+	testLogDir = dir
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// testLogPath returns a stable, per-test path outside the repository. Windows
+// cannot remove files that are still open, so keeping test logs out of the
+// source tree also avoids dirtying the working tree if cleanup races.
+func testLogPath(t *testing.T) string {
+	t.Helper()
+	if p, ok := testLogPaths.Load(t); ok {
+		return p.(string)
+	}
+	p := filepath.Join(testLogDir, fmt.Sprintf("deps_log_%d", testLogCounter.Add(1)))
+	testLogPaths.Store(t, p)
+	return p
+}
+
+// newDepsLog returns a DepsLog that is closed when the test completes.
+// Windows refuses to delete files that are still open, so leaving a log open
+// would otherwise break test cleanup.
+func newDepsLog(t *testing.T) *deps_log.DepsLog {
+	t.Helper()
+	log := deps_log.NewDepsLog()
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		_ = log.Close()
+	})
+	return log
+}
+
+func TestWriteRead(t *testing.T) {
+	os.Remove(testLogPath(t))
+	t.Cleanup(func() {
+		os.Remove(testLogPath(t))
 	})
 
-	log1 := deps_log.NewDepsLog()
+	log1 := newDepsLog(t)
 	state1 := state.New()
-	require.NoError(t, log1.OpenForWrite(testFilename))
+	require.NoError(t, log1.OpenForWrite(testLogPath(t)))
 
 	{
 		deps := make([]*graph.Node, 0)
@@ -50,8 +91,8 @@ func TestWriteRead(t *testing.T) {
 	require.NoError(t, log1.Close())
 
 	state2 := state.New()
-	log2 := deps_log.NewDepsLog()
-	require.NoError(t, log2.Load(testFilename, state2))
+	log2 := newDepsLog(t)
+	require.NoError(t, log2.Load(testLogPath(t), state2))
 
 	require.Equal(t, len(log1.Nodes()), len(log2.Nodes()))
 	require.Equal(t, log1.Nodes(), log2.Nodes())
@@ -67,14 +108,14 @@ func TestWriteRead(t *testing.T) {
 func TestLotsOfDeps(t *testing.T) {
 	const numDeps = 100000
 
-	os.Remove(testFilename)
+	os.Remove(testLogPath(t))
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		os.Remove(testLogPath(t))
 	})
 
-	log1 := deps_log.NewDepsLog()
+	log1 := newDepsLog(t)
 	state1 := state.New()
-	require.NoError(t, log1.OpenForWrite(testFilename))
+	require.NoError(t, log1.OpenForWrite(testLogPath(t)))
 
 	{
 		deps := make([]*graph.Node, 0, numDeps)
@@ -91,24 +132,24 @@ func TestLotsOfDeps(t *testing.T) {
 	require.NoError(t, log1.Close())
 
 	state2 := state.New()
-	log2 := deps_log.NewDepsLog()
-	require.NoError(t, log2.Load(testFilename, state2))
+	log2 := newDepsLog(t)
+	require.NoError(t, log2.Load(testLogPath(t), state2))
 
 	logDeps := log2.GetDeps(state2.GetNode("out.o"))
 	assert.Equal(t, numDeps, len(logDeps.Nodes))
 }
 
 func TestDoubleEntry(t *testing.T) {
-	os.Remove(testFilename)
+	os.Remove(testLogPath(t))
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		os.Remove(testLogPath(t))
 	})
 
 	var fileSize int64
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.OpenForWrite(testFilename))
+		log := newDepsLog(t)
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.h"))
@@ -116,7 +157,7 @@ func TestDoubleEntry(t *testing.T) {
 		log.RecordDeps(st.GetNode("out.o"), 1, deps)
 		require.NoError(t, log.Close())
 
-		stat, err := os.Stat(testFilename)
+		stat, err := os.Stat(testLogPath(t))
 		require.NoError(t, err)
 		fileSize = stat.Size()
 		assert.Greater(t, fileSize, int64(0))
@@ -124,9 +165,9 @@ func TestDoubleEntry(t *testing.T) {
 
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.Load(testFilename, st))
-		require.NoError(t, log.OpenForWrite(testFilename))
+		log := newDepsLog(t)
+		require.NoError(t, log.Load(testLogPath(t), st))
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.h"))
@@ -134,7 +175,7 @@ func TestDoubleEntry(t *testing.T) {
 		log.RecordDeps(st.GetNode("out.o"), 1, deps)
 		require.NoError(t, log.Close())
 
-		stat, err := os.Stat(testFilename)
+		stat, err := os.Stat(testLogPath(t))
 		require.NoError(t, err)
 		fileSize2 := stat.Size()
 		assert.Equal(t, fileSize, fileSize2)
@@ -149,9 +190,9 @@ build out.o: cc
 build other_out.o: cc
 `
 
-	os.Remove(testFilename)
+	os.Remove(testLogPath(t))
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		os.Remove(testLogPath(t))
 	})
 
 	var fileSize int64
@@ -159,8 +200,8 @@ build other_out.o: cc
 		st := state.New()
 		test.AssertParse(t, manifest, st)
 
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.OpenForWrite(testFilename))
+		log := newDepsLog(t)
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.h"))
@@ -174,7 +215,7 @@ build other_out.o: cc
 
 		require.NoError(t, log.Close())
 
-		stat, err := os.Stat(testFilename)
+		stat, err := os.Stat(testLogPath(t))
 		require.NoError(t, err)
 		fileSize = stat.Size()
 		assert.Greater(t, fileSize, int64(0))
@@ -185,16 +226,16 @@ build other_out.o: cc
 		st := state.New()
 		test.AssertParse(t, manifest, st)
 
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.Load(testFilename, st))
-		require.NoError(t, log.OpenForWrite(testFilename))
+		log := newDepsLog(t)
+		require.NoError(t, log.Load(testLogPath(t), st))
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.h"))
 		log.RecordDeps(st.GetNode("out.o"), 1, deps)
 		require.NoError(t, log.Close())
 
-		stat, err := os.Stat(testFilename)
+		stat, err := os.Stat(testLogPath(t))
 		require.NoError(t, err)
 		fileSize2 = stat.Size()
 		assert.Greater(t, fileSize2, fileSize)
@@ -205,8 +246,8 @@ build other_out.o: cc
 		st := state.New()
 		test.AssertParse(t, manifest, st)
 
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.Load(testFilename, st))
+		log := newDepsLog(t)
+		require.NoError(t, log.Load(testLogPath(t), st))
 
 		out := st.GetNode("out.o")
 		deps := log.GetDeps(out)
@@ -223,7 +264,7 @@ build other_out.o: cc
 		assert.Equal(t, "foo.h", deps.Nodes[0].Path())
 		assert.Equal(t, "baz.h", deps.Nodes[1].Path())
 
-		require.NoError(t, log.Recompact(testFilename))
+		require.NoError(t, log.Recompact(testLogPath(t)))
 
 		deps = log.GetDeps(out)
 		require.NotNil(t, deps)
@@ -241,7 +282,7 @@ build other_out.o: cc
 		assert.Equal(t, "baz.h", deps.Nodes[1].Path())
 		assert.Equal(t, otherOut, nodes[otherOut.ID()])
 
-		stat, err := os.Stat(testFilename)
+		stat, err := os.Stat(testLogPath(t))
 		require.NoError(t, err)
 		fileSize3 = stat.Size()
 		assert.Less(t, fileSize3, fileSize2)
@@ -249,8 +290,8 @@ build other_out.o: cc
 
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.Load(testFilename, st))
+		log := newDepsLog(t)
+		require.NoError(t, log.Load(testLogPath(t), st))
 
 		out := st.GetNode("out.o")
 		deps := log.GetDeps(out)
@@ -267,7 +308,7 @@ build other_out.o: cc
 		assert.Equal(t, "foo.h", deps.Nodes[0].Path())
 		assert.Equal(t, "baz.h", deps.Nodes[1].Path())
 
-		require.NoError(t, log.Recompact(testFilename))
+		require.NoError(t, log.Recompact(testLogPath(t)))
 
 		deps = log.GetDeps(out)
 		assert.Nil(t, deps)
@@ -278,7 +319,7 @@ build other_out.o: cc
 		assert.Equal(t, -1, st.LookupNode("foo.h").ID())
 		assert.Equal(t, -1, st.LookupNode("baz.h").ID())
 
-		stat, err := os.Stat(testFilename)
+		stat, err := os.Stat(testLogPath(t))
 		require.NoError(t, err)
 		fileSize4 := stat.Size()
 		assert.Less(t, fileSize4, fileSize3)
@@ -296,16 +337,16 @@ func TestInvalidHeader(t *testing.T) {
 
 	for i, header := range invalidHeaders {
 		t.Run(fmt.Sprintf("header_%d", i), func(t *testing.T) {
-			os.Remove(testFilename)
+			os.Remove(testLogPath(t))
 			t.Cleanup(func() {
-				os.Remove(testFilename)
+				os.Remove(testLogPath(t))
 			})
 
-			require.NoError(t, os.WriteFile(testFilename, []byte(header), 0644))
+			require.NoError(t, os.WriteFile(testLogPath(t), []byte(header), 0644))
 
-			log := deps_log.NewDepsLog()
+			log := newDepsLog(t)
 			st := state.New()
-			err := log.Load(testFilename, st)
+			err := log.Load(testLogPath(t), st)
 			require.Error(t, err)
 			require.Contains(t, "bad deps log signature or version; starting over", err.Error())
 		})
@@ -313,15 +354,15 @@ func TestInvalidHeader(t *testing.T) {
 }
 
 func TestTruncated(t *testing.T) {
-	os.Remove(testFilename)
+	os.Remove(testLogPath(t))
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		os.Remove(testLogPath(t))
 	})
 
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.OpenForWrite(testFilename))
+		log := newDepsLog(t)
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.h"))
@@ -336,19 +377,19 @@ func TestTruncated(t *testing.T) {
 		require.NoError(t, log.Close())
 	}
 
-	stat, err := os.Stat(testFilename)
+	stat, err := os.Stat(testLogPath(t))
 	require.NoError(t, err)
 	originalSize := stat.Size()
 
 	nodeCount := 5
 	depsCount := 2
 	for size := originalSize; size > 0; size-- {
-		err := os.Truncate(testFilename, size)
+		err := os.Truncate(testLogPath(t), size)
 		require.NoError(t, err)
 
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		err = log.Load(testFilename, st)
+		log := newDepsLog(t)
+		err = log.Load(testLogPath(t), st)
 		if err != nil {
 			break
 		}
@@ -368,15 +409,15 @@ func TestTruncated(t *testing.T) {
 }
 
 func TestTruncatedRecovery(t *testing.T) {
-	os.Remove(testFilename)
+	os.Remove(testLogPath(t))
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		os.Remove(testLogPath(t))
 	})
 
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.OpenForWrite(testFilename))
+		log := newDepsLog(t)
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.h"))
@@ -392,21 +433,21 @@ func TestTruncatedRecovery(t *testing.T) {
 	}
 
 	{
-		stat, err := os.Stat(testFilename)
+		stat, err := os.Stat(testLogPath(t))
 		require.NoError(t, err)
-		err = os.Truncate(testFilename, stat.Size()-2)
+		err = os.Truncate(testLogPath(t), stat.Size()-2)
 		require.NoError(t, err)
 	}
 
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		err := log.Load(testFilename, st)
+		log := newDepsLog(t)
+		err := log.Load(testLogPath(t), st)
 		require.NoError(t, err)
 
 		assert.Nil(t, log.GetDeps(st.GetNode("out2.o")))
 
-		require.NoError(t, log.OpenForWrite(testFilename))
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.h"))
@@ -418,8 +459,8 @@ func TestTruncatedRecovery(t *testing.T) {
 
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		err := log.Load(testFilename, st)
+		log := newDepsLog(t)
+		err := log.Load(testLogPath(t), st)
 		require.NoError(t, err)
 
 		deps := log.GetDeps(st.GetNode("out2.o"))
@@ -428,14 +469,14 @@ func TestTruncatedRecovery(t *testing.T) {
 }
 
 func TestReverseDepsNodes(t *testing.T) {
-	os.Remove(testFilename)
+	os.Remove(testLogPath(t))
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		os.Remove(testLogPath(t))
 	})
 
 	st := state.New()
-	log := deps_log.NewDepsLog()
-	require.NoError(t, log.OpenForWrite(testFilename))
+	log := newDepsLog(t)
+	require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 	deps := make([]*graph.Node, 0)
 	deps = append(deps, st.GetNode("foo.h"))
@@ -457,18 +498,18 @@ func TestReverseDepsNodes(t *testing.T) {
 }
 
 func TestMalformedDepsLog(t *testing.T) {
-	const badLogFile = "DepsLogTest-corrupted.tempfile"
+	badLogFile := testLogPath(t) + ".corrupted"
 
 	t.Cleanup(func() {
-		os.Remove(testFilename)
+		os.Remove(testLogPath(t))
 		os.Remove(badLogFile)
 	})
 
 	var originalContents []byte
 	{
 		st := state.New()
-		log := deps_log.NewDepsLog()
-		require.NoError(t, log.OpenForWrite(testFilename))
+		log := newDepsLog(t)
+		require.NoError(t, log.OpenForWrite(testLogPath(t)))
 
 		deps := make([]*graph.Node, 0)
 		deps = append(deps, st.GetNode("foo.hh"))
@@ -477,7 +518,7 @@ func TestMalformedDepsLog(t *testing.T) {
 		require.NoError(t, log.Close())
 
 		var err error
-		originalContents, err = os.ReadFile(testFilename)
+		originalContents, err = os.ReadFile(testLogPath(t))
 		require.NoError(t, err)
 	}
 
@@ -497,7 +538,7 @@ func TestMalformedDepsLog(t *testing.T) {
 		require.NoError(t, writeBadLogFile(badContents))
 
 		st := state.New()
-		log := deps_log.NewDepsLog()
+		log := newDepsLog(t)
 		err := log.Load(badLogFile, st)
 		require.Error(t, err)
 		require.Contains(t, "bad deps log signature or version; starting over", err.Error())
@@ -508,7 +549,7 @@ func TestMalformedDepsLog(t *testing.T) {
 		require.NoError(t, writeBadLogFile(badContents))
 
 		st := state.New()
-		log := deps_log.NewDepsLog()
+		log := newDepsLog(t)
 		err := log.Load(badLogFile, st)
 		require.Error(t, err)
 		require.Contains(t, "bad deps log signature or version; starting over", err.Error())
@@ -519,7 +560,7 @@ func TestMalformedDepsLog(t *testing.T) {
 		require.NoError(t, writeBadLogFile(badContents))
 
 		st := state.New()
-		log := deps_log.NewDepsLog()
+		log := newDepsLog(t)
 		err := log.Load(badLogFile, st)
 		require.NoError(t, err)
 	})
@@ -536,7 +577,7 @@ func TestMalformedDepsLog(t *testing.T) {
 		require.NoError(t, writeBadLogFile(badContents))
 
 		st := state.New()
-		log := deps_log.NewDepsLog()
+		log := newDepsLog(t)
 		err := log.Load(badLogFile, st)
 		require.NoError(t, err)
 	})
@@ -550,7 +591,7 @@ func TestMalformedDepsLog(t *testing.T) {
 		require.NoError(t, writeBadLogFile(badContents))
 
 		st := state.New()
-		log := deps_log.NewDepsLog()
+		log := newDepsLog(t)
 		err := log.Load(badLogFile, st)
 		require.NoError(t, err)
 	})

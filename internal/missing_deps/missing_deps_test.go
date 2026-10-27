@@ -1,7 +1,7 @@
 package missing_deps_test
 
 import (
-	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -15,10 +15,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-)
-
-const (
-	testDepsLogFilename = "MissingDepTest-tempdepslog"
 )
 
 type MissingDependencyTestDelegate struct{}
@@ -47,11 +43,11 @@ func newTestHelper(t *testing.T) *testHelper {
 		state:         state.New(),
 		diskInterface: disk.NewMockDiskInterface(),
 	}
-	os.Remove(testDepsLogFilename)
-	require.NoError(t, th.depsLog.OpenForWrite(testDepsLogFilename))
+	depsLogPath := filepath.Join(t.TempDir(), "MissingDepTest-tempdepslog")
+	require.NoError(t, th.depsLog.OpenForWrite(depsLogPath))
 	th.scanner = missing_deps.NewScanner(th.delegate, th.depsLog, th.state, th.diskInterface)
 	t.Cleanup(func() {
-		os.Remove(testDepsLogFilename)
+		_ = th.depsLog.Close()
 	})
 	return th
 }

@@ -242,6 +242,7 @@ func (d *DepsLog) Load(path string, state *state.State) error {
 		}
 		return err
 	}
+	defer f.Close()
 	buf := make([]byte, maxRecordSize)
 
 	n, err := io.ReadFull(f, buf[:len(fileSignature)])
@@ -255,12 +256,8 @@ func (d *DepsLog) Load(path string, state *state.State) error {
 	if !validHeader || !validVersion {
 		if version == 1 {
 			return fmt.Errorf("deps log version change; rebuilding")
-		} else {
-			return fmt.Errorf("bad deps log signature or version; starting over")
 		}
-		f.Close()
-		os.Remove(path)
-		return nil
+		return fmt.Errorf("bad deps log signature or version; starting over")
 	}
 
 	offset, err := f.Seek(0, io.SeekCurrent)
@@ -355,7 +352,6 @@ func (d *DepsLog) Load(path string, state *state.State) error {
 		}
 		return nil
 	}
-	f.Close()
 	minCompactionEntryCount := 1000
 	compactionRatio := 3
 
